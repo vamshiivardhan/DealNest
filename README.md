@@ -6,7 +6,7 @@ DealNest is an online grocery price-intelligence platform. The backend uses Fast
 
 ```text
 backend/
-  app/           FastAPI application, database setup, ORM models, pricing logic
+  app/           FastAPI application, database setup, and ORM models
   scripts/       Data and price comparison scripts
   alembic/       PostgreSQL schema migrations
   requirements.txt

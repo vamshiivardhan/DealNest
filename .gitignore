@@ -1,5 +1,6 @@
 # Python
 __pycache__/
+*.pyc
 *.py[cod]
 *.egg-info/
 .venv/
@@ -23,6 +24,12 @@ build/
 .env
 .env.*
 !.env.example
+
+# Scraper artifacts and local snapshots
+*cookie_pool*.txt
+*cookie*.json
+daily_data/
+drops/
 
 # Editors and operating systems
 .DS_Store
