@@ -1,149 +1,83 @@
-"""SQLAlchemy ORM models for DealNest's initial database schema."""
-
-from __future__ import annotations
-
 from datetime import datetime
-from decimal import Decimal
+from sqlalchemy import Column, Integer, String, Float, Boolean, ForeignKey, DateTime, Text, UniqueConstraint
+from sqlalchemy.orm import relationship
+from .database import Base
 
-from sqlalchemy import (
-    Boolean,
-    CheckConstraint,
-    DateTime,
-    ForeignKey,
-    Index,
-    Numeric,
-    String,
-    UniqueConstraint,
-    func,
-)
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+class Platform(Base):
+    __tablename__ = "platforms"
 
-from app.database import Base
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String, unique=True, nullable=False)  # e.g., "Amazon", "BigBasket"
+    internal_code = Column(String, unique=True, nullable=False) # e.g., "AMAZON_TEZ_INDIA"
+    
+    # Relationships
+    listings = relationship("StoreListing", back_populates="platform")
 
 
-class Product(Base):
-    """Canonical product identity independent of individual stores."""
+class CanonicalProduct(Base):
+    """
+    The master product entity. Multiple store listings will point here.
+    """
+    __tablename__ = "canonical_products"
 
-    __tablename__ = "products"
-    __table_args__ = (
-        CheckConstraint(
-            "quantity IS NULL OR quantity > 0", name="ck_products_quantity_positive"
-        ),
-    )
-
-    id: Mapped[int] = mapped_column(primary_key=True)
-    name: Mapped[str] = mapped_column(String(255), nullable=False)
-    brand: Mapped[str | None] = mapped_column(String(120))
-    variant: Mapped[str | None] = mapped_column(String(255))
-    quantity: Mapped[Decimal | None] = mapped_column(Numeric(12, 3))
-    unit: Mapped[str | None] = mapped_column(String(32))
-    category: Mapped[str | None] = mapped_column(String(100))
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, server_default=func.now()
-    )
-
-    store_listings: Mapped[list[StoreListing]] = relationship(back_populates="product")
-
-
-class Store(Base):
-    """Shopping platform represented by DealNest."""
-
-    __tablename__ = "stores"
-    __table_args__ = (UniqueConstraint("name", name="uq_stores_name"),)
-
-    id: Mapped[int] = mapped_column(primary_key=True)
-    name: Mapped[str] = mapped_column(String(150), nullable=False)
-    website_url: Mapped[str | None] = mapped_column(String(500))
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, server_default=func.now()
-    )
-
-    store_listings: Mapped[list[StoreListing]] = relationship(back_populates="store")
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String, nullable=False)          # e.g., "Tata Salt Iodized"
+    brand = Column(String, nullable=True)          # e.g., "Tata"
+    category = Column(String, index=True)          # e.g., "foodgrains-oil-masala"
+    base_quantity = Column(Float, nullable=True)   # e.g., 1000.0
+    base_unit = Column(String, nullable=True)      # e.g., "g" or "ml"
+    
+    created_at = Column(DateTime, default=datetime.utcnow)
+    
+    # Relationships
+    listings = relationship("StoreListing", back_populates="canonical_product")
 
 
 class StoreListing(Base):
-    """Store-specific listing, optionally matched to a canonical product."""
-
+    """
+    The specific URL and live price state on a given platform.
+    """
     __tablename__ = "store_listings"
-    __table_args__ = (
-        UniqueConstraint(
-            "store_id", "source_product_id", name="uq_listing_store_source_id"
-        ),
-    )
 
-    id: Mapped[int] = mapped_column(primary_key=True)
-    product_id: Mapped[int | None] = mapped_column(ForeignKey("products.id"))
-    store_id: Mapped[int] = mapped_column(ForeignKey("stores.id"), nullable=False)
-    source_product_id: Mapped[str | None] = mapped_column(String(255))
-    source_name: Mapped[str] = mapped_column(String(500), nullable=False)
-    product_url: Mapped[str | None] = mapped_column(String(2000))
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, server_default=func.now()
-    )
+    id = Column(Integer, primary_key=True, index=True)
+    canonical_product_id = Column(Integer, ForeignKey("canonical_products.id"), nullable=True)
+    platform_id = Column(Integer, ForeignKey("platforms.id"), nullable=False)
+    
+    platform_uid = Column(String, index=True, nullable=False)  # ASIN or BB ID
+    raw_title = Column(String, nullable=False)                 # Exact title from the store
+    url = Column(Text, nullable=False)
+    image_url = Column(Text, nullable=True)
+    
+    # Live State (Updates on every scrape)
+    current_mrp = Column(Float, nullable=True)
+    current_selling_price = Column(Float, nullable=False)
+    in_stock = Column(Boolean, default=True)
+    
+    last_updated = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
-    product: Mapped[Product | None] = relationship(back_populates="store_listings")
-    store: Mapped[Store] = relationship(back_populates="store_listings")
-    current_offers: Mapped[list[CurrentOffer]] = relationship(back_populates="listing")
-    price_history: Mapped[list[PriceHistory]] = relationship(back_populates="listing")
+    # Ensure we don't have duplicate listings for the same platform UID
+    __table_args__ = (UniqueConstraint('platform_id', 'platform_uid', name='uix_platform_uid'),)
 
-
-class CurrentOffer(Base):
-    """Latest known price for a listing in a delivery location."""
-
-    __tablename__ = "current_offers"
-    __table_args__ = (
-        UniqueConstraint(
-            "listing_id", "location_code", name="uq_current_offer_listing_location"
-        ),
-        CheckConstraint("selling_price >= 0", name="ck_current_offer_price_nonnegative"),
-        CheckConstraint("mrp IS NULL OR mrp >= 0", name="ck_current_offer_mrp_nonnegative"),
-    )
-
-    id: Mapped[int] = mapped_column(primary_key=True)
-    listing_id: Mapped[int] = mapped_column(ForeignKey("store_listings.id"), nullable=False)
-    location_code: Mapped[str] = mapped_column(String(128), nullable=False)
-    selling_price: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False)
-    mrp: Mapped[Decimal | None] = mapped_column(Numeric(12, 2))
-    available: Mapped[bool | None] = mapped_column(Boolean)
-    observed_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, server_default=func.now()
-    )
-
-    listing: Mapped[StoreListing] = relationship(back_populates="current_offers")
+    # Relationships
+    platform = relationship("Platform", back_populates="listings")
+    canonical_product = relationship("CanonicalProduct", back_populates="listings")
+    price_history = relationship("PriceHistory", back_populates="listing", cascade="all, delete-orphan")
 
 
 class PriceHistory(Base):
-    """Historical price observations for a listing and delivery location."""
-
+    """
+    Time-series log of price changes for historical analytics.
+    """
     __tablename__ = "price_history"
-    __table_args__ = (
-        UniqueConstraint(
-            "listing_id",
-            "location_code",
-            "observed_at",
-            name="uq_price_history_collection_cycle",
-        ),
-        CheckConstraint("selling_price >= 0", name="ck_price_history_price_nonnegative"),
-        CheckConstraint("mrp IS NULL OR mrp >= 0", name="ck_price_history_mrp_nonnegative"),
-        Index(
-            "ix_price_history_listing_location_time",
-            "listing_id",
-            "location_code",
-            "observed_at",
-        ),
-    )
 
-    id: Mapped[int] = mapped_column(primary_key=True)
-    listing_id: Mapped[int] = mapped_column(ForeignKey("store_listings.id"), nullable=False)
-    location_code: Mapped[str] = mapped_column(String(128), nullable=False)
-    selling_price: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False)
-    mrp: Mapped[Decimal | None] = mapped_column(Numeric(12, 2))
-    available: Mapped[bool | None] = mapped_column(Boolean)
-    observed_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, server_default=func.now()
-    )
+    id = Column(Integer, primary_key=True, index=True)
+    store_listing_id = Column(Integer, ForeignKey("store_listings.id", ondelete="CASCADE"), nullable=False)
+    
+    selling_price = Column(Float, nullable=False)
+    mrp = Column(Float, nullable=True)
+    in_stock = Column(Boolean, default=True)
+    
+    recorded_at = Column(DateTime, default=datetime.utcnow, index=True)
 
-    listing: Mapped[StoreListing] = relationship(back_populates="price_history")
-
-
-__all__ = ["Product", "Store", "StoreListing", "CurrentOffer", "PriceHistory"]
+    # Relationships
+    listing = relationship("StoreListing", back_populates="price_history")
