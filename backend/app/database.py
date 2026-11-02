@@ -6,11 +6,15 @@ from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
-# Uses DATABASE_URL from .env if defined, otherwise defaults to local Postgres
-DATABASE_URL = os.getenv(
-    "DATABASE_URL", 
-    "postgresql+psycopg://vamshij@localhost:5432/dealnest_db"
-)
+DEFAULT_DATABASE_URL = "postgresql+psycopg://vamshij@localhost:5432/dealnest_db"
+
+
+def get_database_url() -> str:
+    """Return the configured PostgreSQL URL, falling back to local development."""
+    return os.getenv("DATABASE_URL") or DEFAULT_DATABASE_URL
+
+
+DATABASE_URL = get_database_url()
 
 engine = create_engine(
     DATABASE_URL,
