@@ -14,6 +14,12 @@ const PLATFORMS = [
   { id: 2, name: "JioMart" }
 ];
 
+const formatPrice = (value) => {
+  const price = Number(value);
+  if (!Number.isFinite(price)) return "0";
+  return Number.isInteger(price) ? String(price) : price.toFixed(2);
+};
+
 export default function App() {
   const [deals, setDeals] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -49,7 +55,7 @@ export default function App() {
       if (selectedPlatform !== "all") {
         params.append("platform_id", selectedPlatform);
       }
-      params.append("limit", "100");
+      params.append("limit", "2500");
 
       try {
         const response = await fetch(`http://127.0.0.1:8000/api/v1/deals?${params.toString()}`);
@@ -70,10 +76,14 @@ export default function App() {
   }, [selectedLocation, selectedPlatform, debouncedSearch]);
 
   const calculateDiscount = (sellingPrice, mrp) => {
-    if (!mrp || mrp <= sellingPrice) return null;
-    const diff = mrp - sellingPrice;
-    const percent = Math.round((diff / mrp) * 100);
-    return { percent, diff: Math.round(diff) };
+    const selling = Number(sellingPrice);
+    const retail = Number(mrp);
+    if (!Number.isFinite(retail) || !Number.isFinite(selling) || retail <= selling) return null;
+    const diff = Math.round((retail - selling) * 100) / 100;
+    if (diff < 1) return null;
+    const percent = Math.round((diff / retail) * 100);
+    if (percent < 1) return null;
+    return { percent, diff };
   };
 
   return (
@@ -236,16 +246,16 @@ export default function App() {
                   <div className="mt-4 pt-3 border-t border-[#1e1f28]">
                     <div className="flex items-baseline gap-2 mb-2">
                       <span className="text-base font-bold text-[#ffffff]">
-                        ₹{deal.current_selling_price}
+                        ₹{formatPrice(deal.current_selling_price)}
                       </span>
-                      {deal.current_mrp && deal.current_mrp > deal.current_selling_price && (
+                      {discount && (
                         <span className="text-xs text-[#636574] line-through">
-                          ₹{deal.current_mrp}
+                          ₹{formatPrice(deal.current_mrp)}
                         </span>
                       )}
                       {discount && (
                         <span className="text-[10px] text-[#868897] ml-auto">
-                          Save ₹{discount.diff}
+                          Save ₹{formatPrice(discount.diff)}
                         </span>
                       )}
                     </div>

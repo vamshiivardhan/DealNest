@@ -1,11 +1,15 @@
 import os
+from pathlib import Path
 from sqlalchemy import create_engine
 from sqlalchemy.orm import declarative_base, sessionmaker
+from dotenv import load_dotenv
+
+load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
 # Uses DATABASE_URL from .env if defined, otherwise defaults to local Postgres
 DATABASE_URL = os.getenv(
     "DATABASE_URL", 
-    "postgresql://vamshij@localhost:5432/dealnest_db"
+    "postgresql+psycopg://vamshij@localhost:5432/dealnest_db"
 )
 
 engine = create_engine(

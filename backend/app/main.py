@@ -3,9 +3,9 @@ from typing import List, Optional
 from datetime import datetime
 from fastapi import FastAPI, Depends, Query, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, computed_field
 from sqlalchemy.orm import Session
-from sqlalchemy import desc
+from sqlalchemy import and_, case, desc, func
 
 from app.database import get_db, engine, Base
 from app.models import StoreListing, Platform, CanonicalProduct, PriceHistory
@@ -52,6 +52,22 @@ class DealOut(BaseModel):
     location: str
     last_updated: Optional[datetime] = None
 
+    @computed_field
+    @property
+    def discount_percent(self) -> int:
+        mrp = self.current_mrp
+        selling_price = self.current_selling_price
+        if mrp is None or mrp <= selling_price:
+            return 0
+        return round(((mrp - selling_price) / mrp) * 100)
+
+    @computed_field
+    @property
+    def savings(self) -> float:
+        if self.current_mrp is None:
+            return 0.0
+        return round(self.current_mrp - self.current_selling_price, 2)
+
 class HealthResponse(BaseModel):
     status: str
     database: str
@@ -91,7 +107,7 @@ def get_deals(
         default=None, 
         description="Filter by platform identifier"
     ),
-    limit: int = Query(default=100, ge=1, le=500),
+    limit: int = Query(default=2500, ge=1, le=2500),
     skip: int = Query(default=0, ge=0),
     db: Session = Depends(get_db)
 ):
@@ -112,8 +128,27 @@ def get_deals(
     if platform_id is not None:
         query = query.filter(StoreListing.platform_id == platform_id)
 
-    # Order by highest discount percentage if MRP exists, otherwise by ID
-    deals = query.order_by(desc(StoreListing.id)).offset(skip).limit(limit).all()
+    price_difference = StoreListing.current_mrp - StoreListing.current_selling_price
+    is_real_deal = and_(
+        StoreListing.current_mrp.is_not(None),
+        StoreListing.current_mrp > StoreListing.current_selling_price,
+        price_difference >= 1.0,
+    )
+    discount_fraction = case(
+        (is_real_deal, price_difference / func.nullif(StoreListing.current_mrp, 0)),
+        else_=None,
+    )
+    deals = (
+        query.order_by(
+            case((is_real_deal, 1), else_=0).desc(),
+            desc(discount_fraction).nullslast(),
+            desc(StoreListing.last_updated).nullslast(),
+            desc(StoreListing.id),
+        )
+        .offset(skip)
+        .limit(limit)
+        .all()
+    )
     return deals
 
 
