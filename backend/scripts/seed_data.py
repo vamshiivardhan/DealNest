@@ -13,9 +13,9 @@ def seed_bigbasket_data():
     db = SessionLocal()
     
     # 1. Ensure the BigBasket Platform exists
-    platform = db.query(Platform).filter(Platform.internal_code == "BIGBASKET_PAN_INDIA").first()
+    platform = db.query(Platform).filter(Platform.name == "BigBasket").first()
     if not platform:
-        platform = Platform(name="BigBasket", internal_code="BIGBASKET_PAN_INDIA")
+        platform = Platform(name="BigBasket", base_url="https://www.bigbasket.com/")
         db.add(platform)
         db.commit()
         db.refresh(platform)

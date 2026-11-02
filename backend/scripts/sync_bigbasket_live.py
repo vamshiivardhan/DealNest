@@ -12,7 +12,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from playwright.sync_api import sync_playwright
 from sqlalchemy.orm import Session
 from app.database import SessionLocal
-from app.models import StoreListing, PriceHistory
+from app.models import Platform, StoreListing, PriceHistory
 
 
 def _iter_sku_products(node, sku_id):
@@ -170,7 +170,8 @@ def sync_bigbasket_prices(limit: int | None = None, offset: int = 0):
     try:
         query = (
             db.query(StoreListing)
-            .filter(StoreListing.platform_id == 1)
+            .join(Platform, StoreListing.platform_id == Platform.id)
+            .filter(Platform.name == "BigBasket")
             .order_by(StoreListing.id.asc())
         )
         listings = query.offset(offset).limit(limit).all()
