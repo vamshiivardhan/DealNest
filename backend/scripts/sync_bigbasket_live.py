@@ -1,262 +1,328 @@
-import sys
+"""Concurrent BigBasket Matrix API scraper and DealNest database sync."""
+
+import argparse
 import os
-import json
-import re
-import time
 import random
+import re
+import sys
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
+from pathlib import Path
 
-# Ensure backend directory is in Python path
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+import requests
+from sqlalchemy import text
+from dotenv import load_dotenv
 
-from playwright.sync_api import sync_playwright
-from sqlalchemy.orm import Session
-from app.database import SessionLocal
-from app.models import Platform, StoreListing, PriceHistory
+load_dotenv(Path(__file__).resolve().parents[1] / ".env")
+os.environ.setdefault(
+    "DATABASE_URL",
+    "postgresql+psycopg://dealnest:dealnest@51.20.107.225:5432/dealnest_db",
+)
+sys.path.append(str(Path(__file__).resolve().parents[1]))
 
-
-def _iter_sku_products(node, sku_id):
-    """Yield only product dictionaries whose own ID matches the page SKU."""
-    if isinstance(node, dict):
-        if str(node.get("id", "")) == sku_id:
-            yield node
-        for value in node.values():
-            yield from _iter_sku_products(value, sku_id)
-    elif isinstance(node, list):
-        for value in node:
-            yield from _iter_sku_products(value, sku_id)
+from app.database import SessionLocal  # noqa: E402
+from app.models import CanonicalProduct, PriceHistory, StoreListing  # noqa: E402
 
 
-def _price_as_float(value):
-    if value is None:
-        return None
-    try:
-        if isinstance(value, str):
-            value = value.replace("₹", "").replace(",", "").strip()
-        return round(float(value), 2)
-    except (TypeError, ValueError):
-        return None
+BASE_URL = "https://www.bigbasket.com"
+MATRIX_URL = f"{BASE_URL}/listing-svc/v2/products"
+CATEGORIES = [
+    "electronics", "fashion", "fruits-vegetables", "foodgrains-oil-masala",
+    "bakery-cakes-dairy", "beverages", "snacks-branded-foods", "beauty-hygiene",
+    "cleaning-household", "kitchen-garden-pets", "eggs-meat-fish",
+    "gourmet-world-food", "baby-care", "paan-corner",
+]
+MAX_WORKERS = 15
+REQUEST_TIMEOUT = 30
+SCRAPER_API_URL = "https://api.scraperapi.com/"
+SCRAPER_API_KEY = "17cb5d57fe01142ce83b2eefa772355a"
+COOKIE_LOCK = threading.Lock()
+_cookie_index = 0
 
 
-def _price_from_discount(product):
-    pricing = product.get("pricing")
-    if not isinstance(pricing, dict):
-        return None, None
-    discount = pricing.get("discount")
-    if not isinstance(discount, dict):
-        return None, None
-
-    prim_price = discount.get("prim_price")
-    sp_value = prim_price.get("sp") if isinstance(prim_price, dict) else None
-    if sp_value is None:
-        sp_value = discount.get("sp")
-    return _price_as_float(sp_value), _price_as_float(discount.get("mrp"))
-
-
-def _sku_from_url(url):
-    match = re.search(r"/pd/(\d+)", url or "")
-    return match.group(1) if match else None
+def load_cookies() -> list[str]:
+    script_pool = Path(__file__).resolve().with_name("bb_cookie_pool.txt")
+    cwd_pool = Path.cwd() / "bb_cookie_pool.txt"
+    pool_path = script_pool if script_pool.is_file() else cwd_pool
+    if not pool_path.is_file():
+        raise FileNotFoundError(
+            f"Cookie pool not found at {script_pool} or {cwd_pool}. Run generate_bb_cookies.py first."
+        )
+    cookies = [line.strip() for line in pool_path.read_text(encoding="utf-8").splitlines()
+               if line.strip() and not line.lstrip().startswith("#")]
+    if not cookies:
+        raise ValueError(f"No cookies found in {pool_path}")
+    print(f"Loaded {len(cookies)} BigBasket session cookie(s) from {pool_path}.")
+    return cookies
 
 
-def extract_live_bigbasket_price(page, item_url: str) -> tuple[float | None, float | None, bool]:
-    selling_price = None
-    mrp = None
-    in_stock = True
+def next_cookie(cookies: list[str]) -> str:
+    global _cookie_index
+    with COOKIE_LOCK:
+        cookie = cookies[_cookie_index % len(cookies)]
+        _cookie_index += 1
+        return cookie
 
-    sku_id = _sku_from_url(item_url)
-    if not sku_id:
-        return None, None, in_stock
 
-    # 1. Read prices from the narrowest ancestor of the main product title
-    # that contains both labels. This keeps carousel prices out of the result.
-    try:
-        visible_prices = page.evaluate("""() => {
-            const title = document.querySelector('h1');
-            if (!title) return null;
-            let node = title;
-            for (let depth = 0; node && depth < 12; depth += 1, node = node.parentElement) {
-                const text = node.innerText || '';
-                const price = text.match(/Price:\\s*₹\\s*([0-9]+(?:\\.[0-9]+)?)/i);
-                const mrp = text.match(/MRP:\\s*₹\\s*([0-9]+(?:\\.[0-9]+)?)/i);
-                if (price && mrp) {
-                    return { sp: parseFloat(price[1]), mrp: parseFloat(mrp[1]) };
-                }
-            }
-            return null;
-        }""")
-        if visible_prices:
-            selling_price = _price_as_float(visible_prices.get("sp"))
-            mrp = _price_as_float(visible_prices.get("mrp"))
-    except Exception:
-        pass
+def request_headers(cookie: str) -> dict[str, str]:
+    is_bbnow = "xentrycontext=bbnow" in cookie.lower()
+    return {
+        "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "accept": "application/json, text/plain, */*",
+        "x-channel": "BB-WEB",
+        "x-entry-context-id": "10" if is_bbnow else "100",
+        "x-entry-context": "bbnow" if is_bbnow else "bb-b2c",
+        "osmos-enabled": "true",
+        "cookie": cookie,
+    }
 
-    html = page.content()
 
-    # 2. Fall back to __NEXT_DATA__ only on the product dictionary matching
-    # this URL's SKU. Other products in carousels and recommendations are ignored.
-    next_data_matches = re.findall(
-        r'<script\b(?=[^>]*\bid=["\']__NEXT_DATA__["\'])(?=[^>]*\btype=["\']application/json["\'])[^>]*>(.*?)</script>',
-        html,
-        re.IGNORECASE | re.DOTALL,
-    )
-    for raw_json in next_data_matches:
+def fetch_page(category: str, page_number: int, cookies: list[str], retries: int = 3):
+    params = {"type": "pc", "slug": category, "page": page_number}
+    headers = request_headers(next_cookie(cookies))
+    last_error = None
+    for attempt in range(retries + 1):
         try:
-            page_data = json.loads(raw_json)
-        except (TypeError, json.JSONDecodeError):
-            continue
-
-        for product in _iter_sku_products(page_data, sku_id):
-            parsed_sp, parsed_mrp = _price_from_discount(product)
-            if selling_price is None and parsed_sp is not None:
-                selling_price = parsed_sp
-            if mrp is None and parsed_mrp is not None:
-                mrp = parsed_mrp
-            if selling_price is not None and mrp is not None:
+            response = requests.get(
+                MATRIX_URL, params=params,
+                headers=headers, timeout=REQUEST_TIMEOUT,
+            )
+            if response.status_code == 403:
+                target_url = requests.Request("GET", MATRIX_URL, params=params).prepare().url
+                print(f"   HTTP 403 for {category} page {page_number}; retrying through ScraperAPI.")
+                response = requests.get(
+                    SCRAPER_API_URL,
+                    params={
+                        "api_key": SCRAPER_API_KEY,
+                        "url": target_url,
+                        "country_code": "in",
+                        "keep_headers": "true",
+                    },
+                    headers=headers,
+                    timeout=REQUEST_TIMEOUT,
+                )
+            if response.status_code == 429:
+                last_error = requests.HTTPError("HTTP 429 Too Many Requests")
+                if attempt < retries:
+                    time.sleep(4)
+                    continue
                 break
-        if selling_price is not None and mrp is not None:
-            break
+            response.raise_for_status()
+            return response.json()
+        except (requests.RequestException, ValueError) as exc:
+            last_error = exc
+            if attempt < retries:
+                time.sleep(4 if getattr(getattr(exc, "response", None), "status_code", None) == 429
+                           else min(2 ** attempt, 4))
+    print(f"   Request failed for {category} page {page_number}: {last_error}")
+    return None
 
-    # 3. Final fallback to JSON-LD only when its Product SKU matches the URL.
-    if selling_price is None or mrp is None:
-        ld_matches = re.findall(
-            r'<script\b[^>]*type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
-            html,
-            re.IGNORECASE | re.DOTALL,
-        )
-        for ld_raw in ld_matches:
-            try:
-                data = json.loads(ld_raw)
-                items = data if isinstance(data, list) else [data]
-                for item in items:
-                    if not isinstance(item, dict):
-                        continue
-                    item_type = item.get("@type")
-                    is_product = item_type == "Product" or (
-                        isinstance(item_type, list) and "Product" in item_type
-                    )
-                    item_sku = item.get("sku")
-                    if not is_product or (item_sku is not None and str(item_sku) != sku_id):
-                        continue
 
-                    offers = item.get("offers", {})
-                    if isinstance(offers, list):
-                        offers = offers[0] if offers else {}
-                    if not isinstance(offers, dict):
-                        offers = {}
+def product_info(data):
+    if not isinstance(data, dict):
+        return {}
+    tabs = data.get("tabs") or []
+    if not tabs or not isinstance(tabs[0], dict):
+        return {}
+    info = tabs[0].get("product_info")
+    return info if isinstance(info, dict) else {}
 
-                    if selling_price is None:
-                        selling_price = _price_as_float(offers.get("price"))
-                    if mrp is None:
-                        mrp = _price_as_float(
-                            offers.get("highPrice")
-                            or offers.get("listPrice")
-                            or item.get("mrp")
-                        )
-                    availability = str(offers.get("availability", "")).lower()
-                    if "outofstock" in availability:
-                        in_stock = False
-                    break
-            except Exception:
+
+def extract_products(data) -> list[dict]:
+    info = product_info(data)
+    products = info.get("products") or []
+    extracted = []
+    for item in products:
+        if not isinstance(item, dict):
+            continue
+        product_id = str(item.get("id", "")).strip()
+        description = item.get("desc", "") or ""
+        brand_data = item.get("brand") or {}
+        brand = brand_data.get("name", "") if isinstance(brand_data, dict) else ""
+        relative_url = item.get("absolute_url", "") or ""
+        full_url = f"{BASE_URL}{relative_url}" if relative_url.startswith("/") else relative_url
+        pricing = item.get("pricing") or {}
+        discount_data = pricing.get("discount") or {}
+        prim_price = discount_data.get("prim_price") or {}
+        try:
+            mrp = float(discount_data.get("mrp") or 0.0)
+            selling_price = float(prim_price.get("sp") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        images = item.get("images") or []
+        image_url = ""
+        if images and isinstance(images[0], dict):
+            image_url = images[0].get("l") or images[0].get("m") or images[0].get("url", "")
+        availability = item.get("availability") or {}
+        avail_status = availability.get("avail_status", "001") if isinstance(availability, dict) else "001"
+        if not product_id or not full_url or selling_price <= 0:
+            continue
+        extracted.append({
+            "product_id": product_id,
+            "description": description,
+            "brand": brand,
+            "url": full_url,
+            "mrp": mrp,
+            "selling_price": selling_price,
+            "image_url": image_url,
+            "in_stock": avail_status == "001",
+        })
+    return extracted
+
+
+def discover(cookies: list[str]) -> tuple[list[dict], list[tuple[str, int]]]:
+    print(f"Phase 1 Discovery: fetching page 1 for {len(CATEGORIES)} categories...")
+    all_products: list[dict] = []
+    tasks: list[tuple[str, int]] = []
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = {executor.submit(fetch_page, cat, 1, cookies): cat for cat in CATEGORIES}
+        for future in as_completed(futures):
+            category = futures[future]
+            data = future.result()
+            if data is None:
                 continue
+            all_products.extend(extract_products(data))
+            info = product_info(data)
+            pages = info.get("number_of_pages", 1)
+            try:
+                pages = int(pages or 1)
+            except (TypeError, ValueError):
+                pages = 1
+            tasks.extend((category, page) for page in range(2, max(1, pages) + 1))
+            print(f"   {category}: {len(info.get('products') or [])} on page 1; {pages} page(s)")
+    random.shuffle(tasks)
+    print(f"Phase 1 complete: discovered {len(tasks)} additional page task(s).")
+    return all_products, tasks
 
-    if selling_price is not None and (mrp is None or mrp < selling_price):
-        mrp = selling_price
 
-    return selling_price, mrp, in_stock
+def scrape_pages(tasks: list[tuple[str, int]], cookies: list[str], products: list[dict]) -> list[dict]:
+    print(f"Phase 2 Matrix Scraping: fetching {len(tasks)} page(s) with {MAX_WORKERS} workers...")
+    if tasks:
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            futures = {executor.submit(fetch_page, cat, page, cookies): (cat, page)
+                       for cat, page in tasks}
+            completed = 0
+            for future in as_completed(futures):
+                cat, page = futures[future]
+                data = future.result()
+                if data is not None:
+                    products.extend(extract_products(data))
+                completed += 1
+                if completed % 50 == 0 or completed == len(tasks):
+                    print(f"   Matrix pages completed: {completed}/{len(tasks)}")
+    # Deduplicate by product ID, falling back to canonical URL when an ID is absent.
+    deduped = {}
+    for item in products:
+        key = item["product_id"] or item["url"]
+        deduped[key] = item
+    products = list(deduped.values())
+    print(f"Phase 2 complete: collected {len(products)} unique scraped product(s).")
+    return products
 
 
-def sync_bigbasket_prices(limit: int | None = None, offset: int = 0):
-    db: Session = SessionLocal()
+def sync_database(products: list[dict], upsert_all: bool) -> tuple[int, int]:
+    print("Phase 3 Database Commit: matching and applying scraped prices...")
+    db = SessionLocal()
+    updated = inserted = 0
     try:
-        query = (
-            db.query(StoreListing)
-            .join(Platform, StoreListing.platform_id == Platform.id)
-            .filter(Platform.name == "BigBasket")
-            .order_by(StoreListing.id.asc())
-        )
-        listings = query.offset(offset).limit(limit).all()
+        # Select only columns used here: the deployed platforms table may not
+        # include every optional column present in the ORM model (such as base_url).
+        platform_row = db.execute(text(
+            "SELECT id, name FROM platforms WHERE name ILIKE 'bigbasket' LIMIT 1"
+        )).first()
+        if platform_row is None:
+            raise RuntimeError("BigBasket platform row was not found in platforms.")
+        platform_id = platform_row.id
+        existing = db.query(StoreListing).filter(StoreListing.platform_id == platform_id).all()
+        by_uid = {str(row.platform_uid): row for row in existing}
+        by_url = {row.url.rstrip("/"): row for row in existing}
+        by_pd = {}
+        for row in existing:
+            uid = str(row.platform_uid or "")
+            match = re.search(r"\d+", uid)
+            url_match = re.search(r"/pd/(\d+)", row.url or "")
+            title_match = re.search(r"\b(\d{5,})\b", row.raw_title or "")
+            for value in (match.group(0) if match else None,
+                          url_match.group(1) if url_match else None,
+                          title_match.group(1) if title_match else None):
+                if value:
+                    by_pd[value] = row
 
-        total = len(listings)
-        print(f"🚀 Connecting to live Chrome session (port 9222) for {total} products...\n")
-
-        with sync_playwright() as p:
-            # Connect over Chrome DevTools Protocol to the open browser
-            browser = p.chromium.connect_over_cdp("http://127.0.0.1:9222")
-            context = browser.contexts[0]
-            page = context.pages[0] if context.pages else context.new_page()
-
-            updated_count = 0
-            consecutive_403s = 0
-            for idx, item in enumerate(listings, start=1):
-                item_number = offset + idx
-                print(f"[{item_number}/{offset + total}] Checking: {item.raw_title[:45]}...")
-                try:
-                    response = page.goto(item.url, wait_until="domcontentloaded", timeout=25000)
-                    status_code = response.status if response else "Unknown"
-                    page.wait_for_timeout(1500)
-
-                    access_denied = status_code == 403 or "Access Denied" in page.title()
-                    if access_denied:
-                        consecutive_403s += 1
-                        print(f"   ❌ Access Denied (HTTP {status_code}) on {item.url}")
-                        if consecutive_403s >= 2:
-                            print(
-                                "🚨 WAF BLOCK DETECTED. Stopping script to prevent IP ban. "
-                                f"Resume later from item {item_number}."
-                            )
-                            break
-                        if idx % 25 == 0:
-                            print("   ☕ Taking a brief 15-second human pause to avoid rate limits...")
-                            time.sleep(random.uniform(12.0, 18.0))
-                        time.sleep(random.uniform(3.5, 6.5))
-                        continue
-
-                    if status_code == 200:
-                        consecutive_403s = 0
-
-                    live_sp, live_mrp, in_stock = extract_live_bigbasket_price(page, item_url=item.url)
-
-                    if live_sp is not None:
-                        old_sp = float(item.current_selling_price) if item.current_selling_price is not None else 0.0
-
-                        item.current_selling_price = live_sp
-                        item.current_mrp = live_mrp
-                        item.in_stock = in_stock
-                        item.last_updated = datetime.utcnow()
-
-                        history_entry = PriceHistory(
-                            store_listing_id=item.id,
-                            mrp=live_mrp,
-                            selling_price=live_sp,
-                            in_stock=in_stock,
-                            recorded_at=datetime.utcnow(),
-                        )
-                        db.add(history_entry)
-                        db.commit()
-                        updated_count += 1
-
-                        if round(old_sp, 2) != round(live_sp, 2):
-                            print(f"   ✅ [HTTP {status_code}] PRICE CHANGED: DB ₹{old_sp} -> LIVE ₹{live_sp} (MRP: ₹{live_mrp})")
-                        else:
-                            print(f"   ✓ [HTTP {status_code}] Verified Live: ₹{live_sp} (MRP: ₹{live_mrp})")
-                    else:
-                        print(f"   ⚠️ [HTTP {status_code}] Loaded page, but no price found")
-
-                except Exception as e:
-                    db.rollback()
-                    print(f"   ❌ Error loading URL: {str(e).splitlines()[0]}")
-
-                if idx % 25 == 0:
-                    print("   ☕ Taking a brief 15-second human pause to avoid rate limits...")
-                    time.sleep(random.uniform(12.0, 18.0))
-
-                time.sleep(random.uniform(3.5, 6.5))
-
-        print(f"\n🎉 Sync Complete! Successfully verified/updated {updated_count}/{total} items.")
-
+        history_rows = []
+        for item in products:
+            listing = by_uid.get(item["product_id"]) or by_url.get(item["url"].rstrip("/")) or by_pd.get(item["product_id"])
+            if listing is None and not upsert_all:
+                continue
+            title = " ".join(part for part in (item["brand"], item["description"]) if part).strip()
+            if listing is None:
+                canonical = CanonicalProduct(
+                    name=(item["description"] or title or item["product_id"])[:255],
+                    brand=(item["brand"] or None), image_url=(item["image_url"] or None),
+                )
+                db.add(canonical)
+                db.flush()
+                listing = StoreListing(
+                    canonical_product_id=canonical.id,
+                    platform_id=platform_id,
+                    platform_uid=item["product_id"],
+                    raw_title=(title or item["description"] or item["product_id"])[:500],
+                    url=item["url"], image_url=item["image_url"] or None,
+                    current_mrp=item["mrp"], current_selling_price=item["selling_price"],
+                    in_stock=item["in_stock"], location="HYDERABAD",
+                )
+                db.add(listing)
+                db.flush()
+                inserted += 1
+            else:
+                listing.current_selling_price = item["selling_price"]
+                listing.current_mrp = item["mrp"]
+                listing.in_stock = item["in_stock"]
+                listing.image_url = item["image_url"] or listing.image_url
+                listing.url = item["url"] or listing.url
+                listing.last_updated = datetime.utcnow()
+                updated += 1
+                if listing.canonical_product:
+                    listing.canonical_product.image_url = item["image_url"] or listing.canonical_product.image_url
+                    if item["brand"] and not listing.canonical_product.brand:
+                        listing.canonical_product.brand = item["brand"][:100]
+            history_rows.append(PriceHistory(
+                store_listing_id=listing.id,
+                selling_price=item["selling_price"], mrp=item["mrp"],
+                in_stock=item["in_stock"],
+            ))
+        db.add_all(history_rows)
+        db.commit()
+        print(f"Phase 3 complete: {updated} existing listing(s) updated; {inserted} new listing(s) inserted; "
+              f"{len(history_rows)} price history record(s) committed.")
+        return updated, inserted
+    except Exception:
+        db.rollback()
+        raise
     finally:
         db.close()
 
 
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--upsert-all", action="store_true",
+                        help="insert newly discovered products as DealNest listings; default only updates existing listings")
+    parser.add_argument("--update-existing", action="store_true",
+                        help="update only listings already present (the default)")
+    args = parser.parse_args()
+    started = time.monotonic()
+    try:
+        cookies = load_cookies()
+        products, tasks = discover(cookies)
+        products = scrape_pages(tasks, cookies, products)
+        updated, inserted = sync_database(products, upsert_all=args.upsert_all)
+        print(f"Sync complete: scraped {len(products)} item(s), matched/updated {updated} existing listing(s), "
+              f"inserted {inserted}; total execution time {time.monotonic() - started:.1f}s.")
+    except Exception as exc:
+        print(f"BigBasket sync failed: {exc}", file=sys.stderr)
+        raise
+
+
 if __name__ == "__main__":
-    sync_bigbasket_prices(offset=372)
+    main()
